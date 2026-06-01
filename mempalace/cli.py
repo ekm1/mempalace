@@ -33,6 +33,7 @@ import os
 import sys
 import shlex
 import argparse
+import contextlib
 from pathlib import Path
 
 from .config import MempalaceConfig
@@ -486,6 +487,47 @@ def _maybe_run_mine_after_init(args, cfg) -> None:
         sys.exit(1)
 
 
+@contextlib.contextmanager
+def _surface_mine_errors():
+    """Translate mine-time exceptions into operator banners + exit 1.
+
+    Every command that drives a miner (``mempalace mine`` via ``cmd_mine`` and
+    ``mempalace kiro sync`` via ``cmd_kiro``) must surface ``MineAlreadyRunning``
+    and ``MineValidationError`` identically rather than dumping a raw traceback.
+    Centralizing the handling here keeps the recovery banner consistent no
+    matter which command happens to surface the corruption.
+    """
+    from .palace import MineAlreadyRunning, MineValidationError
+
+    try:
+        yield
+    except MineAlreadyRunning as exc:
+        # A live MCP server or another mine is already writing to this
+        # palace. Surface the holder identity so the operator knows what
+        # to wait for (or stop), and exit non-zero so wrappers like
+        # nohup / scripts can detect the contention.
+        print(f"mempalace: {exc}", file=sys.stderr)
+        sys.exit(1)
+    except MineValidationError as exc:
+        # PRAGMA quick_check on chroma.sqlite3 returned errors at end of mine.
+        # The corruption may pre-date the mine; we surface it here so automation
+        # cannot proceed against a half-broken palace. Reuse cmd_repair's
+        # recovery banner so the operator sees one consistent message regardless
+        # of which command surfaces it.
+        from .repair import print_sqlite_integrity_abort
+
+        print_sqlite_integrity_abort(exc.palace_path, exc.errors)
+        print(
+            "\n  PRAGMA quick_check after this mine reported errors (the corruption\n"
+            "  may pre-date the mine itself). Drawers may still be intact for direct\n"
+            "  lookup; wing-filtered or full-text search will fail until the FTS5\n"
+            "  index is rebuilt. `mempalace repair --yes` rebuilds the FTS5 virtual\n"
+            "  table automatically (step 6 of the recovery above).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
 def cmd_mine(args):
     palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
     include_ignored = []
@@ -502,9 +544,7 @@ def cmd_mine(args):
             llm_provider=None,
         )
 
-    from .palace import MineAlreadyRunning, MineValidationError
-
-    try:
+    with _surface_mine_errors():
         if args.mode == "convos":
             from .convo_miner import mine_convos
 
@@ -542,31 +582,6 @@ def cmd_mine(args):
                 include_ignored=include_ignored,
                 max_chunks_per_file=getattr(args, "max_chunks_per_file", None),
             )
-    except MineAlreadyRunning as exc:
-        # A live MCP server or another mine is already writing to this
-        # palace. Surface the holder identity so the operator knows what
-        # to wait for (or stop), and exit non-zero so wrappers like
-        # nohup / scripts can detect the contention.
-        print(f"mempalace: {exc}", file=sys.stderr)
-        sys.exit(1)
-    except MineValidationError as exc:
-        # PRAGMA quick_check on chroma.sqlite3 returned errors at end of mine.
-        # The corruption may pre-date the mine; we surface it here so automation
-        # cannot proceed against a half-broken palace. Reuse cmd_repair's
-        # recovery banner so the operator sees one consistent message regardless
-        # of which command surfaces it.
-        from .repair import print_sqlite_integrity_abort
-
-        print_sqlite_integrity_abort(exc.palace_path, exc.errors)
-        print(
-            "\n  PRAGMA quick_check after this mine reported errors (the corruption\n"
-            "  may pre-date the mine itself). Drawers may still be intact for direct\n"
-            "  lookup; wing-filtered or full-text search will fail until the FTS5\n"
-            "  index is rebuilt. `mempalace repair --yes` rebuilds the FTS5 virtual\n"
-            "  table automatically (step 6 of the recovery above).",
-            file=sys.stderr,
-        )
-        sys.exit(1)
 
 
 def cmd_sweep(args):
@@ -1037,7 +1052,13 @@ def cmd_kiro(args):
     elif action == "uninstall":
         lines = kiro_install.uninstall(local=local)
     elif action == "sync":
-        lines = kiro_install.sync(palace=palace, agent_dir=args.agent_dir, dry_run=args.dry_run)
+        # `kiro sync` drives the convo miner, so it can hit the same
+        # end-of-mine FTS5 validation failure (MineValidationError) or
+        # writer contention (MineAlreadyRunning) that `mempalace mine`
+        # does. Route both through the shared banner so automation gets an
+        # actionable recovery message and exit 1 instead of a raw traceback.
+        with _surface_mine_errors():
+            lines = kiro_install.sync(palace=palace, agent_dir=args.agent_dir, dry_run=args.dry_run)
     elif action == "status":
         lines = kiro_install.status(local=local, agent_dir=args.agent_dir)
     else:
