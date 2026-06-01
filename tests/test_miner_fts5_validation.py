@@ -16,6 +16,7 @@ import pytest
 
 from mempalace import cli, convo_miner, miner
 from mempalace.palace import (
+    MineAlreadyRunning,
     MineValidationError,
     _validate_palace_fts5_after_mine,
 )
@@ -555,3 +556,90 @@ def test_mine_formats_full_chain_raises_when_fts5_corrupt(tmp_path, monkeypatch)
     assert called == [str(palace)], f"validator must be the raise-source; spy recorded: {called}"
     assert "fts5" in " ".join(exc_info.value.errors).lower()
     assert exc_info.value.palace_path == str(palace)
+
+
+# ── 8. `mempalace kiro sync` surfaces the same recovery banner ──────
+
+
+def _kiro_sync_args(palace: str) -> SimpleNamespace:
+    """Build the args namespace cmd_kiro reads for the `sync` action."""
+    return SimpleNamespace(
+        kiro_action="sync",
+        local=None,
+        palace=palace,
+        agent_dir=None,
+        dry_run=False,
+    )
+
+
+def test_cmd_kiro_sync_exits_nonzero_with_banner(tmp_path, monkeypatch, capsys):
+    """`mempalace kiro sync` drives the convo miner via kiro_install.sync, so a
+    corrupted-FTS5 palace must surface the same recovery banner cmd_mine prints
+    instead of a raw MineValidationError traceback.
+
+    Regression: cmd_kiro previously had no except clause, so the reporter saw a
+    bare traceback ending in `MineValidationError: FTS5/SQLite quick_check
+    failed` rather than the actionable `mempalace repair --yes` instructions.
+    """
+    from mempalace import kiro_install
+
+    palace = str(tmp_path / "palace")
+
+    def _raise(*_, **__):
+        raise MineValidationError(
+            palace, ["malformed inverted index for FTS5 table main.embedding_fulltext_search"]
+        )
+
+    monkeypatch.setattr(kiro_install, "sync", _raise)
+
+    with pytest.raises(SystemExit) as exit_info:
+        cli.cmd_kiro(_kiro_sync_args(palace))
+
+    assert exit_info.value.code == 1
+    captured = capsys.readouterr()
+    combined = captured.out + captured.err
+    assert "SQLite-layer corruption detected" in combined
+    assert "PRAGMA quick_check" in combined
+    assert "malformed inverted index" in combined
+    assert "mempalace repair --yes" in combined
+
+
+def test_cmd_kiro_sync_surfaces_mine_already_running(tmp_path, monkeypatch, capsys):
+    """The shared handler also routes MineAlreadyRunning (a live writer / MCP
+    server holding the palace lock) to a clean exit-1 message rather than a
+    traceback, matching `mempalace mine`.
+    """
+    from mempalace import kiro_install
+
+    palace = str(tmp_path / "palace")
+
+    def _raise(*_, **__):
+        raise MineAlreadyRunning("palace is locked by PID 4242 (mempalace mcp)")
+
+    monkeypatch.setattr(kiro_install, "sync", _raise)
+
+    with pytest.raises(SystemExit) as exit_info:
+        cli.cmd_kiro(_kiro_sync_args(palace))
+
+    assert exit_info.value.code == 1
+    captured = capsys.readouterr()
+    combined = captured.out + captured.err
+    assert "PID 4242" in combined
+
+
+def test_cmd_kiro_sync_clean_palace_prints_summary(tmp_path, monkeypatch, capsys):
+    """A successful sync must still print the summary lines and not exit, proving
+    the _surface_mine_errors wrapper is transparent on the happy path.
+    """
+    from mempalace import kiro_install
+
+    palace = str(tmp_path / "palace")
+
+    monkeypatch.setattr(
+        kiro_install, "sync", lambda *_, **__: [f"Synced Kiro sessions into {palace}"]
+    )
+
+    cli.cmd_kiro(_kiro_sync_args(palace))
+
+    captured = capsys.readouterr()
+    assert "Synced Kiro sessions" in captured.out
